@@ -3,11 +3,9 @@
  *  WHACK-A-BUNNY + EMOTION DETECTOR — Integrated JS
  *  CS Student Project: Human & Computer Interaction
  *
- *  New in this version:
- *   - Polls /emotion_data every 500 ms while page is open
- *   - Updates emotion panel (emoji, label, confidence bars)
- *   - Records emotion log during active gameplay
- *   - Shows dominant emotion on Game-Over screen
+ *  Webcam approach: browser captures frames via getUserMedia,
+ *  sends them to /analyze endpoint as base64 JPEG.
+ *  No server-side camera access needed — works on Railway!
  * ========================================================
  */
 
@@ -43,10 +41,16 @@ const state = {
 /* ── Emotion Session State ───────────────────────────────── */
 const emotionSession = {
   recording:    false,
-  counts:       {},    // { Happy: 12, Sad: 3, … }
-  log:          [],    // [{ label, emoji, time }, …]
-  pollInterval: null,
+  counts:       {},
+  log:          [],
   lastLabel:    null,
+};
+
+/* ── Webcam State ────────────────────────────────────────── */
+const webcam = {
+  stream:       null,
+  analyzeTimer: null,
+  busy:         false,       // prevent overlapping /analyze calls
 };
 
 /* ── DOM helpers ─────────────────────────────────────────── */
@@ -92,7 +96,6 @@ function startGame() {
   showScreen('game');
   $('timer').classList.remove('urgent');
 
-  // Start emotion session recording
   startEmotionSession();
 
   const cfg = DIFFICULTY[state.difficulty];
@@ -170,7 +173,6 @@ function endGame() {
   $('final-best').textContent  = state.best;
   $('new-best-badge').classList.toggle('hidden', !isNewBest);
 
-  // Emoji / title based on score
   const emoji     = $('over-emoji');
   const overTitle = $('over-title');
   const overSub   = $('over-sub');
@@ -193,9 +195,7 @@ function endGame() {
     overSub.textContent   = 'You are absolutely unstoppable! 🎉';
   }
 
-  // Show dominant emotion summary
   showEmotionSummary();
-
   setTimeout(() => showScreen('over'), 400);
 }
 
@@ -247,48 +247,108 @@ function nowStr() {
 }
 
 /* ════════════════════════════════════════════════════════════
-   EMOTION PANEL LOGIC
+   WEBCAM — Browser-side capture → /analyze endpoint
 ════════════════════════════════════════════════════════════ */
 
-/** Called once when the page loads – starts continuous polling */
-function startEmotionPolling() {
-  // Hide overlay once camera stream loads
-  const camImg = $('cam-feed');
-  if (camImg) {
-    camImg.addEventListener('load', () => {
-      const overlay = $('cam-overlay');
-      if (overlay) overlay.classList.add('hidden');
-    });
+/**
+ * Request webcam access, attach stream to <video>, start analysis loop.
+ * Called once on page load.
+ */
+async function initWebcam() {
+  const video   = $('cam-video');
+  const overlay = $('cam-overlay');
+  const overlayText = $('cam-overlay-text');
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    overlayText.textContent = '📷 Camera not supported in this browser.';
+    return;
   }
 
-  // Poll emotion endpoint every 500 ms
-  setInterval(fetchEmotion, 500);
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 320, height: 240, facingMode: 'user' },
+      audio: false,
+    });
+
+    webcam.stream = stream;
+    video.srcObject = stream;
+
+    video.addEventListener('loadedmetadata', () => {
+      // Hide the overlay once video is playing
+      overlay.classList.add('hidden');
+      // Start sending frames to /analyze every 700ms
+      webcam.analyzeTimer = setInterval(captureAndAnalyze, 700);
+    });
+
+  } catch (err) {
+    console.warn('[Webcam] getUserMedia error:', err);
+    if (err.name === 'NotAllowedError') {
+      overlayText.textContent = '📷 Camera permission denied. Please allow camera access.';
+    } else if (err.name === 'NotFoundError') {
+      overlayText.textContent = '📷 No camera found on this device.';
+    } else {
+      overlayText.textContent = '📷 Could not start camera.';
+    }
+  }
 }
 
-/** Fetch latest emotion from Flask */
-async function fetchEmotion() {
+/**
+ * Capture current video frame → send to /analyze → update emotion panel.
+ */
+async function captureAndAnalyze() {
+  if (webcam.busy) return;   // skip if previous request still pending
+  webcam.busy = true;
+
+  const video  = $('cam-video');
+  const canvas = $('cam-canvas');
+
+  if (!video || video.readyState < 2) {
+    webcam.busy = false;
+    return;
+  }
+
+  // Draw current video frame onto hidden canvas
+  canvas.width  = video.videoWidth  || 320;
+  canvas.height = video.videoHeight || 240;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // Export as base64 JPEG (quality 0.7 keeps payload small)
+  const frameB64 = canvas.toDataURL('image/jpeg', 0.7);
+
   try {
-    const res  = await fetch('/emotion_data');
+    const res  = await fetch('/analyze', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ frame: frameB64 }),
+    });
     const data = await res.json();
+
     updateEmotionPanel(data);
 
-    // Record to session if game is running
     if (emotionSession.recording && data.label) {
       recordEmotionTick(data);
     }
-  } catch (_) { /* server not ready yet, ignore */ }
+  } catch (_) {
+    // server not ready / network hiccup — silently ignore
+  } finally {
+    webcam.busy = false;
+  }
 }
+
+/* ════════════════════════════════════════════════════════════
+   EMOTION PANEL LOGIC
+════════════════════════════════════════════════════════════ */
 
 /** Update the right-hand emotion panel UI */
 function updateEmotionPanel(data) {
   const { label, emoji, confidence, all_scores } = data;
 
-  // Big emoji + label
   const emojiEl = $('ep-emoji-big');
   if (emojiEl && emojiEl.textContent !== emoji) {
     emojiEl.textContent = emoji;
     emojiEl.classList.remove('pop');
-    void emojiEl.offsetWidth; // reflow to restart animation
+    void emojiEl.offsetWidth;
     emojiEl.classList.add('pop');
   }
   const labelEl = $('ep-label');
@@ -296,7 +356,6 @@ function updateEmotionPanel(data) {
   const confEl  = $('ep-conf');
   if (confEl)  confEl.textContent  = `${(confidence * 100).toFixed(0)}%`;
 
-  // Bars
   if (all_scores) {
     Object.entries(all_scores).forEach(([emo, score]) => {
       const fill = $(`bar-${emo}`);
@@ -318,8 +377,6 @@ function startEmotionSession() {
   emotionSession.counts    = {};
   emotionSession.log       = [];
   emotionSession.lastLabel = null;
-
-  // Clear log UI
   const logEl = $('ep-log');
   if (logEl) logEl.innerHTML = '';
 }
@@ -329,14 +386,11 @@ function stopEmotionSession() {
   emotionSession.recording = false;
 }
 
-/** Called every poll tick while a game is running */
+/** Called every analysis tick while a game is running */
 function recordEmotionTick(data) {
   const { label, emoji } = data;
-
-  // Count
   emotionSession.counts[label] = (emotionSession.counts[label] || 0) + 1;
 
-  // Only log when emotion changes (avoid duplicate spam)
   if (label !== emotionSession.lastLabel) {
     emotionSession.lastLabel = label;
     const entry = { label, emoji, time: nowStr() };
@@ -349,26 +403,21 @@ function recordEmotionTick(data) {
 function appendLogEntry({ label, emoji, time }) {
   const logEl = $('ep-log');
   if (!logEl) return;
-
-  // Remove placeholder
   const placeholder = logEl.querySelector('.ep-log-empty');
   if (placeholder) placeholder.remove();
 
   const li = document.createElement('li');
   li.innerHTML = `<span>${emoji}</span><span>${label}</span><span class="log-time">${time}</span>`;
-  logEl.prepend(li);   // newest on top
-
-  // Keep log to max 30 entries
+  logEl.prepend(li);
   while (logEl.children.length > 30) logEl.removeChild(logEl.lastChild);
 }
 
-/** After game ends, find dominant emotion and show it on over-screen */
+/** After game ends, find dominant emotion and show on over-screen */
 function showEmotionSummary() {
   const counts  = emotionSession.counts;
   const entries = Object.entries(counts);
   if (entries.length === 0) return;
 
-  // Find most frequent
   entries.sort((a, b) => b[1] - a[1]);
   const [domLabel] = entries[0];
 
@@ -416,4 +465,4 @@ $('btn-home').addEventListener('click',    () => showScreen('start'));
 /* ── Init ────────────────────────────────────────────────── */
 updateHUD();
 showScreen('start');
-startEmotionPolling();
+initWebcam();   // Start browser webcam on page load

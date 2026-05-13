@@ -129,11 +129,13 @@
         {% endif %}
       </div>
 
-      <!-- Webcam feed -->
-      <div class="ep-cam-wrap">
-        <img id="cam-feed" src="/video_feed" alt="Webcam feed" class="ep-cam" />
+      <!-- Browser webcam feed (replaces MJPEG stream) -->
+      <div class="ep-cam-wrap" style="position:relative;">
+        <video id="cam-video" class="ep-cam" autoplay playsinline muted
+               style="width:100%;border-radius:12px;display:block;"></video>
+        <canvas id="cam-canvas" style="display:none;"></canvas>
         <div class="ep-cam-overlay" id="cam-overlay">
-          <span>📷 Starting camera…</span>
+          <span id="cam-overlay-text">📷 Starting camera…</span>
         </div>
       </div>
 
